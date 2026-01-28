@@ -1,10 +1,11 @@
 import socket
+import os
 import struct
 import json
 from pynput import keyboard
 
 class ScrcpyInfiniteMapper:
-    def __init__(self, host='127.0.0.1', port=1234, sw=2400, sh=1080):
+    def __init__(self, host='127.0.0.1', port=1234, sw=1920, sh=1080):
         self.host = host
         self.port = port
         self.sw = sw
@@ -12,108 +13,109 @@ class ScrcpyInfiniteMapper:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         
         self.key_map = {}
-        self.active_keys = {} # Store key: pointer_id mapping
-        self.enabled = True
-        self.switch_key = 'backtick' 
+        self.active_keys = {} 
+        self.exit_key = 'esc'
 
     def connect(self):
         try:
             self.sock.connect((self.host, self.port))
-            print(f"[*] Connected! Multi-Touch Active. Hold keys to keep buttons pressed.")
+            self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            print(f"[*] Connected! Multi-Touch Active. Press '{self.exit_key}' to quit.")
         except Exception as e:
             print(f"[!] Connection Error: {e}")
             exit(1)
 
     def load_json_map(self, json_data):
         data = json.loads(json_data)
-        # Assign unique pointer IDs starting from 0 to each mapped key
         for index, node in enumerate(data['keyMapNodes']):
-            raw_key = node['key'].replace("Key_", "").lower()
-            px = int(node['pos']['x'] * self.sw)
-            py = int(node['pos']['y'] * self.sh)
-            
-            self.key_map[raw_key] = {
-                "x": px, 
-                "y": py, 
-                "comment": node['comment'], 
-                "pid": index  # Unique 'finger' index
+            name = node['key'].lower()
+            self.key_map[name] = {
+                "x": int(node['pos']['x']), 
+                "y": int(node['pos']['y']), 
+                "pid": index + 10 
             }
-        print(f"[*] Loaded {len(self.key_map)} unique touch points.")
+        print(f"[*] Loaded {len(self.key_map)} points.")
+
+    def get_key_name(self, key):
+        if hasattr(key, 'char') and key.char is not None:
+            return key.char.lower()
+        name = getattr(key, 'name', str(key)).lower()
+        if 'ctrl' in name: return 'ctrl'
+        if 'alt' in name: return 'alt'
+        if 'shift' in name: return 'shift'
+        if 'space' in name: return 'space'
+        return name
 
     def send_touch(self, x, y, action, pointer_id):
-        """v3.3.4 - 32-byte Control Message"""
         msg_type = 2
-        pressure = 65535 if action in [0, 2] else 0
-        btn = 1 if action in [0, 2] else 0
         
-        # Structure: Type(1), Action(1), PID(8), X(4), Y(4), W(2), H(2), Pres(2), ActBtn(4), Btns(4)
-        msg = struct.pack('>BBQIIHHHII', 
-                          msg_type, action, pointer_id, 
-                          x, y, self.sw, self.sh, 
-                          pressure, btn, btn)
+        # DOWN (0) or MOVE (2)
+        if action in (0, 2):
+            pressure = 65535
+            buttons = 1  # Primary button
+        # UP (1)
+        else:
+            pressure = 0
+            buttons = 0  # CRITICAL: No buttons/pressure on release
+
+        # scrcpy expects: Type, Action, PID, X, Y, W, H, Pressure, ActionButtons, Buttons
+        msg = struct.pack('>BBQIIHHHII',
+                          msg_type, action, pointer_id,
+                          x, y, self.sw, self.sh,
+                          pressure, 1 if action == 0 else 0, buttons)
         self.sock.sendall(msg)
 
     def on_press(self, key):
-        try:
-            k = key.char.lower() if hasattr(key, 'char') else key.name.lower()
-            
-            if k == self.switch_key:
-                self.enabled = not self.enabled
-                print(f"\n[ SYSTEM ] Keymapper {'ENABLED' if self.enabled else 'DISABLED'}")
-                if not self.enabled: self.release_all()
-                return
+        k = self.get_key_name(key)
+        if k == self.exit_key:
+            self.release_all()
+            os._exit(0)
 
-            if self.enabled and k in self.key_map:
-                if k not in self.active_keys:
-                    # Key is pressed down for the first time
-                    data = self.key_map[k]
-                    self.active_keys[k] = data['pid']
-                    print(f"[ HOLDING ] {data['comment']} (Finger {data['pid']})")
-                    self.send_touch(data['x'], data['y'], 0, data['pid'])
-                # If key is already in active_keys, pynput is just repeating the OS 'held' signal. 
-                # We ignore it so we don't spam the server.
-        except Exception: pass
+        if k in self.key_map and k not in self.active_keys:
+            data = self.key_map[k]
+            self.active_keys[k] = data['pid']
+            self.send_touch(data['x'], data['y'], 0, data['pid']) # Action 0: DOWN
 
     def on_release(self, key):
-        try:
-            k = key.char.lower() if hasattr(key, 'char') else key.name.lower()
-            if k in self.active_keys:
-                data = self.key_map[k]
-                print(f"[ RELEASE ] {data['comment']} (Finger {data['pid']})")
-                self.send_touch(data['x'], data['y'], 1, data['pid'])
-                del self.active_keys[k]
-        except Exception: pass
+        k = self.get_key_name(key)
+        
+        if k in self.active_keys:
+            # 1. Grab the pointer ID we assigned when it was pressed
+            pid = self.active_keys[k]
+            data = self.key_map[k]
+            
+            # 2. Send the UP event at the same location with 0 pressure
+            # We use the PID stored in active_keys to ensure consistency
+            self.send_touch(data['x'], data['y'], 1, pid) 
+            
+            # 3. NOW remove it from the tracker
+            # This prevents the 'repeat' logic from getting confused
+            del self.active_keys[k]
+            print(f"[-] Released {k} (PID: {pid})")
 
     def release_all(self):
-        """Emergency release for all active touch points"""
         for k, pid in list(self.active_keys.items()):
             data = self.key_map[k]
             self.send_touch(data['x'], data['y'], 1, pid)
         self.active_keys.clear()
-        print("[*] All touch points lifted.")
 
 # --- Mappings ---
 JSON_MAP = """
 {
   "keyMapNodes": [
-    {"comment": "W", "key": "Key_W", "pos": {"x": 0.9414, "y": 0.8357}},
-    {"comment": "S", "key": "Key_S", "pos": {"x": 0.8558, "y": 0.8357}},
-    {"comment": "Space", "key": "Key_Space", "pos": {"x": 0.4707, "y": 0.9749}},
-    {"comment": "D", "key": "Key_D", "pos": {"x": 0.1712, "y": 0.8357}},
-    {"comment": "A", "key": "Key_A", "pos": {"x": 0.1284, "y": 0.8357}},
-    {"comment": "H", "key": "Key_H", "pos": {"x": 0.1498, "y": 0.7428}},
-    {"comment": "E", "key": "Key_E", "pos": {"x": 0.2353, "y": 0.7428}},
-    {"comment": "Q", "key": "Key_Q", "pos": {"x": 0.0642, "y": 0.7428}},
-    {"comment": "Shift", "key": "Key_Shift", "pos": {"x": 0.9628, "y": 0.4643}},
-    {"comment": "Alt", "key": "Key_Alt", "pos": {"x": 0.9628, "y": 0.5107}},
-    {"comment": "Control", "key": "Key_Control", "pos": {"x": 0.9628, "y": 0.5571}}
+    {"key": "w", "pos": {"x": 1807, "y": 902}},
+    {"key": "s", "pos": {"x": 1643, "y": 902}},
+    {"key": "a", "pos": {"x": 120, "y": 902}},
+    {"key": "d", "pos": {"x": 328, "y": 902}},
+    {"key": "space", "pos": {"x": 903, "y": 1052}},
+    {"key": "shift", "pos": {"x": 1848, "y": 501}},
+    {"key": "ctrl", "pos": {"x": 1848, "y": 601}}
   ]
 }
 """
 
 if __name__ == "__main__":
-    # Ensure sw/sh match your device's orientation (Landscape usually means sw > sh)
-    mapper = ScrcpyInfiniteMapper(sw=2400, sh=1080)
+    mapper = ScrcpyInfiniteMapper(sw=1920, sh=1080)
     mapper.load_json_map(JSON_MAP)
     mapper.connect()
     
