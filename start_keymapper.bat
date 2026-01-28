@@ -9,8 +9,8 @@ adb forward tcp:1234 localabstract:scrcpy
 
 echo [*] Starting scrcpy-server in a new window...
 :: This starts the server in a separate process
-start "scrcpy_server" adb shell CLASSPATH=%SERVER_PATH% app_process / com.genymobile.scrcpy.Server 3.3.4 tunnel_forward=true audio=false control=true video=false log_level=debug
-
+@REM start "scrcpy_server" adb shell CLASSPATH=%SERVER_PATH% app_process / com.genymobile.scrcpy.Server 3.3.4 tunnel_forward=true audio=false control=true video=false log_level=verbose
+start "scrcpy_server" cmd /k "adb shell CLASSPATH=%SERVER_PATH% app_process / com.genymobile.scrcpy.Server 3.3.4 tunnel_forward=true audio=false control=true video=false log_level=verbose display_id=30"
 echo [*] Waiting for server to initialize...
 timeout /t 3 >nul
 
@@ -26,7 +26,6 @@ taskkill /FI "WINDOWTITLE eq scrcpy_server" /F >nul 2>&1
 
 
 :: TODO: Reimplement the python code without AI
-:: TODO: Test if it works on virtual displays
 :: TODO: Test if it works on MacOS and Linux
 :: TODO: Create a python and json based simple keymap manager
 :: TODO: Create a python based keymap creator which tracks the logs of adb for touch press
